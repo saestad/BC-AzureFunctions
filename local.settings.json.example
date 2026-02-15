@@ -1,0 +1,14 @@
+{
+    "IsEncrypted": false,
+    "Values": {
+        "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+        "FUNCTIONS_WORKER_RUNTIME": "dotnet-isolated",
+        "FUNCTIONS_INPROC_NET8_ENABLED": "1",
+        "BC_TENANT_ID": "{BC TENANT ID}",
+        "BC_CLIENT_ID": "{CLIENT SECRET ID SET UP IN AZURE AD APP REGISTRATION}",
+        "BC_CLIENT_SECRET": "{CLIENT SECRET GENERATED IN AZURE AD APP REGISTRATION}",
+        "BC_ENVIRONMENT": "{ENVIRONMENT NAME SUCH AS PRODUCTION OR SANDBOX}",
+        "BC_COMPANY_ID": "{COMPANY ID IN BUSINESS CENTRAL}",
+        "SQL_CONNECTION_STRING": "{SQL CONNECTION STRING}"    }
+}
+
