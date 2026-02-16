@@ -244,4 +244,4 @@ SET LastSyncDateTime = '2000-01-01';
 Proprietary. All rights reserved. 2026 Stein Saestad
 
 ## Hours spent on project
-Per 15.02.2026 - 8 hours
+14.02.2026 - 15.02.2026 | 8 hours
