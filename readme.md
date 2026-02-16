@@ -1,4 +1,4 @@
-# BC-AzureFunctions
+# Business Central Azure Functions
 
 A C# Azure Functions project that syncs data from Business Central custom API endpoints into Azure SQL on a schedule. Part of the Analytics API by Saestad product.
 
