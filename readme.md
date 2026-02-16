@@ -238,3 +238,7 @@ SET LastSyncDateTime = '2000-01-01';
 
 **Stein Saestad**
 [saestad.no](https://saestad.no)
+
+## License
+
+Proprietary. All rights reserved. 2026 Stein Saestad
