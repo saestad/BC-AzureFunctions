@@ -1,4 +1,4 @@
-# BC-AzureFunctions
+# Business Central Azure Functions
 
 A C# Azure Functions project that syncs data from Business Central custom API endpoints into Azure SQL on a schedule. Part of the Analytics API by Saestad product.
 
@@ -238,3 +238,10 @@ SET LastSyncDateTime = '2000-01-01';
 
 **Stein Saestad**
 [saestad.no](https://saestad.no)
+
+## License
+
+Proprietary. All rights reserved. 2026 Stein Saestad
+
+## Hours spent on project
+14.02.2026 - 15.02.2026 | 8 hours
