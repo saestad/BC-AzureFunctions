@@ -1,19 +1,42 @@
 # Business Central Azure Functions
 
-A C# Azure Functions project that syncs data from Business Central custom API endpoints into Azure SQL on a schedule. Part of the Analytics API by Saestad product.
+A multi-tenant C# Azure Functions project that syncs data from Business Central custom API endpoints into Azure SQL on a schedule. Part of the Analytics API by Saestad SaaS product.
 
 ## Overview
 
-This function connects to the BC API endpoints exposed by the [BC-AnalyticsAPI](https://github.com/saestad/BC-AnalyticsAPI) AL extension, pulls data incrementally using `lastModifiedDateTime`, and upserts it into an Azure SQL database. Power BI then connects to Azure SQL instead of BC directly.
-
+This function connects to BC API endpoints exposed by the [BC-AnalyticsAPI](https://github.com/saestad/BC-AnalyticsAPI) AL extension, pulls data incrementally using `lastModifiedDateTime`, and upserts it into isolated per-tenant Azure SQL databases. Power BI then connects to Azure SQL instead of BC directly.
 ```
 BC Custom API (AL Extension)
         ↓
 Azure Function (this project)
         ↓
-Azure SQL Database (star schema)
+Control Database (tenant metadata)
         ↓
-Power BI
+Per-Tenant Databases (isolated data)
+        ↓
+Power BI (per customer)
+```
+
+## Multi-Tenant Architecture
+
+**Control Plane Database:** `analyticsapi-control`
+- Tracks all customer tenants and their BC environments
+- Stores metadata (tenant names, database locations, company mappings)
+- Logs sync history across all tenants
+
+**Per-Tenant Databases:** `analyticsapi-{tenantslug}`
+- One isolated database per customer
+- Contains all their BC environments and companies
+- Data distinguished by `EnvironmentName` and `CompanyId` columns
+
+**Example Structure:**
+```
+SQL Server: {yourserver}.database.windows.net
+├─ analyticsapi-control (metadata)
+├─ analyticsapi-acme (Acme Corp's data)
+│   └─ ProductionNO, ProductionUS, ProductionSE environments
+├─ analyticsapi-contoso (Contoso Ltd's data)
+└─ analyticsapi-fabrikam (Fabrikam Inc's data)
 ```
 
 ## Endpoints Synced
@@ -29,8 +52,8 @@ Power BI
 
 - .NET 8 SDK
 - Azure Functions Core Tools v4
-- Azure SQL Database with the analytics schema created
-- BC-AnalyticsAPI AL extension installed in your BC environment
+- Azure SQL Server with control database and tenant databases
+- BC-AnalyticsAPI AL extension installed in customer BC environments
 - Azure AD app registration with `API.ReadWrite.All` application permission granted for BC
 
 ## Setup
@@ -47,7 +70,6 @@ cp local.settings.json.example local.settings.json
 ```
 
 3. Fill in your values in `local.settings.json`:
-
 ```json
 {
     "IsEncrypted": false,
@@ -55,12 +77,10 @@ cp local.settings.json.example local.settings.json
         "AzureWebJobsStorage": "UseDevelopmentStorage=true",
         "FUNCTIONS_WORKER_RUNTIME": "dotnet-isolated",
         "FUNCTIONS_INPROC_NET8_ENABLED": "1",
-        "BC_TENANT_ID": "{BC TENANT ID}",
-        "BC_CLIENT_ID": "{CLIENT ID FROM AZURE AD APP REGISTRATION}",
         "BC_CLIENT_SECRET": "{CLIENT SECRET FROM AZURE AD APP REGISTRATION}",
-        "BC_ENVIRONMENT": "{ENVIRONMENT NAME e.g. Sandbox_Env or Production}",
-        "BC_COMPANY_ID": "{COMPANY ID IN BUSINESS CENTRAL}",
-        "SQL_CONNECTION_STRING": "{SQL CONNECTION STRING}"
+        "SQL_USER": "{SQL SERVER USERNAME}",
+        "SQL_PASSWORD": "{SQL SERVER PASSWORD}",
+        "CONTROL_DB_CONNECTION_STRING": "Server={SERVER}.database.windows.net;Database=analyticsapi-control;User Id={USER};Password={PASSWORD};TrustServerCertificate=True;"
     }
 }
 ```
@@ -69,8 +89,8 @@ cp local.settings.json.example local.settings.json
 
 4. Install Azurite for local storage emulation
 ```
-VS Code Extensions -> search Azurite -> Install
-Ctrl+Shift+P -> Azurite: Start
+VS Code Extensions → search Azurite → Install
+Ctrl+Shift+P → Azurite: Start
 ```
 
 5. Build and run
@@ -86,14 +106,73 @@ Invoke-RestMethod -Uri "http://localhost:7071/admin/functions/SyncTimer" -Method
 
 ## Azure SQL Schema
 
-Run this in SSMS or Azure Data Studio to create the required tables before the first sync:
-
+### Control Plane Database: `analyticsapi-control`
 ```sql
+CREATE DATABASE [analyticsapi-control];
+GO
+
+USE [analyticsapi-control];
+GO
+
+CREATE TABLE dbo.Tenants (
+    TenantId                UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    TenantName              NVARCHAR(100) NOT NULL,
+    TenantSlug              NVARCHAR(50) NOT NULL UNIQUE,
+    SubscriptionTier        NVARCHAR(20),
+    SubscriptionStatus      NVARCHAR(20) DEFAULT 'Active',
+    DatabaseServer          NVARCHAR(100) NOT NULL,
+    DatabaseName            NVARCHAR(100) NOT NULL,
+    DatabaseTier            NVARCHAR(20),
+    IsActive                BIT NOT NULL DEFAULT 1,
+    CreatedDate             DATETIME2 NOT NULL DEFAULT GETUTCDATE(),
+    BillingEmail            NVARCHAR(255),
+    TechnicalContactEmail   NVARCHAR(255)
+);
+
+CREATE TABLE dbo.TenantEnvironments (
+    EnvironmentId           UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    TenantId                UNIQUEIDENTIFIER NOT NULL,
+    EnvironmentName         NVARCHAR(50) NOT NULL,
+    BCTenantId              UNIQUEIDENTIFIER NOT NULL,
+    CompanyId               UNIQUEIDENTIFIER NOT NULL,
+    CompanyName             NVARCHAR(100) NOT NULL,
+    AzureADClientId         UNIQUEIDENTIFIER NOT NULL,
+    ClientSecretKeyVaultUri NVARCHAR(200),
+    IsActive                BIT NOT NULL DEFAULT 1,
+    LastSyncDateTime        DATETIME2,
+    CreatedDate             DATETIME2 NOT NULL DEFAULT GETUTCDATE(),
+    FOREIGN KEY (TenantId) REFERENCES dbo.Tenants(TenantId)
+);
+
+CREATE TABLE dbo.SyncHistory (
+    SyncId                  UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    TenantId                UNIQUEIDENTIFIER NOT NULL,
+    EnvironmentId           UNIQUEIDENTIFIER NOT NULL,
+    SyncStarted             DATETIME2 NOT NULL,
+    SyncCompleted           DATETIME2,
+    RecordsSynced           INT,
+    Status                  NVARCHAR(20),
+    ErrorMessage            NVARCHAR(MAX),
+    FOREIGN KEY (TenantId) REFERENCES dbo.Tenants(TenantId),
+    FOREIGN KEY (EnvironmentId) REFERENCES dbo.TenantEnvironments(EnvironmentId)
+);
+```
+
+### Per-Tenant Database: `analyticsapi-{tenantslug}`
+```sql
+CREATE DATABASE [analyticsapi-acme]; -- Replace 'acme' with tenant slug
+GO
+
+USE [analyticsapi-acme];
+GO
+
 CREATE SCHEMA analytics;
 GO
 
 CREATE TABLE analytics.dim_Account (
-    SystemId                    UNIQUEIDENTIFIER PRIMARY KEY,
+    SystemId                    UNIQUEIDENTIFIER,
+    EnvironmentName             NVARCHAR(50),
+    CompanyId                   UNIQUEIDENTIFIER,
     No                          NVARCHAR(20),
     Name                        NVARCHAR(100),
     AccountType                 NVARCHAR(50),
@@ -103,11 +182,14 @@ CREATE TABLE analytics.dim_Account (
     IncomeBalance               NVARCHAR(50),
     Indentation                 INT,
     Blocked                     BIT,
-    LastModifiedDateTime        DATETIME2
+    LastModifiedDateTime        DATETIME2,
+    PRIMARY KEY (SystemId, EnvironmentName, CompanyId)
 );
 
 CREATE TABLE analytics.fact_GL (
-    SystemId                UNIQUEIDENTIFIER PRIMARY KEY,
+    SystemId                UNIQUEIDENTIFIER,
+    EnvironmentName         NVARCHAR(50),
+    CompanyId               UNIQUEIDENTIFIER,
     EntryNo                 INT,
     GLAccountNo             NVARCHAR(20),
     PostingDate             DATE,
@@ -118,20 +200,26 @@ CREATE TABLE analytics.fact_GL (
     DebitAmount             DECIMAL(18,2),
     CreditAmount            DECIMAL(18,2),
     DimensionSetId          INT,
-    LastModifiedDateTime    DATETIME2
+    LastModifiedDateTime    DATETIME2,
+    PRIMARY KEY (SystemId, EnvironmentName, CompanyId)
 );
 
 CREATE TABLE analytics.dim_Dimension (
-    SystemId                UNIQUEIDENTIFIER PRIMARY KEY,
+    SystemId                UNIQUEIDENTIFIER,
+    EnvironmentName         NVARCHAR(50),
+    CompanyId               UNIQUEIDENTIFIER,
     DimensionSetId          INT,
     DimensionCode           NVARCHAR(20),
     DimensionValueCode      NVARCHAR(20),
     DimensionValueName      NVARCHAR(100),
-    LastModifiedDateTime    DATETIME2
+    LastModifiedDateTime    DATETIME2,
+    PRIMARY KEY (SystemId, EnvironmentName, CompanyId)
 );
 
 CREATE TABLE analytics.fact_Budget (
-    SystemId                UNIQUEIDENTIFIER PRIMARY KEY,
+    SystemId                UNIQUEIDENTIFIER,
+    EnvironmentName         NVARCHAR(50),
+    CompanyId               UNIQUEIDENTIFIER,
     EntryNo                 INT,
     BudgetName              NVARCHAR(50),
     GLAccountNo             NVARCHAR(20),
@@ -139,23 +227,27 @@ CREATE TABLE analytics.fact_Budget (
     Amount                  DECIMAL(18,2),
     Description             NVARCHAR(100),
     DimensionSetId          INT,
-    LastModifiedDateTime    DATETIME2
+    LastModifiedDateTime    DATETIME2,
+    PRIMARY KEY (SystemId, EnvironmentName, CompanyId)
 );
 
 CREATE TABLE analytics.SyncLog (
-    TableName               NVARCHAR(50) PRIMARY KEY,
+    EnvironmentName         NVARCHAR(50),
+    TableName               NVARCHAR(50),
     LastSyncDateTime        DATETIME2,
     RowsSynced              INT,
     SyncStatus              NVARCHAR(20),
-    LastError               NVARCHAR(500)
+    LastError               NVARCHAR(MAX),
+    PRIMARY KEY (EnvironmentName, TableName)
 );
 
-INSERT INTO analytics.SyncLog (TableName, LastSyncDateTime, RowsSynced, SyncStatus)
+-- Seed SyncLog for initial sync
+INSERT INTO analytics.SyncLog (EnvironmentName, TableName, LastSyncDateTime, RowsSynced, SyncStatus)
 VALUES 
-    ('dim_Account', '2000-01-01', 0, 'Pending'),
-    ('fact_GL', '2000-01-01', 0, 'Pending'),
-    ('dim_Dimension', '2000-01-01', 0, 'Pending'),
-    ('fact_Budget', '2000-01-01', 0, 'Pending');
+    ('Production', 'dim_Account', '2000-01-01', 0, 'Pending'),
+    ('Production', 'fact_GL', '2000-01-01', 0, 'Pending'),
+    ('Production', 'dim_Dimension', '2000-01-01', 0, 'Pending'),
+    ('Production', 'fact_Budget', '2000-01-01', 0, 'Pending');
 ```
 
 ## Azure AD App Registration
@@ -176,7 +268,7 @@ https://businesscentral.dynamics.com/OAuthLanding.htm
 
 ## BC Setup
 
-In your BC environment, register the app under **Microsoft Entra Applications**:
+In each customer's BC environment, register the app under **Microsoft Entra Applications**:
 
 | Field | Value |
 |---|---|
@@ -191,11 +283,10 @@ Assign these permission sets to the app:
 | D365 BASIC |
 
 ## Project Structure
-
 ```
 BC-AzureFunctions/
 ├── Functions/
-│   └── SyncTimer.cs              # Timer trigger - runs every 30 minutes
+│   └── SyncTimer.cs              # Timer trigger - loops through all tenants
 ├── Models/
 │   ├── GLAccount.cs
 │   ├── GLEntry.cs
@@ -203,9 +294,10 @@ BC-AzureFunctions/
 │   ├── GLBudgetEntry.cs
 │   └── ODataResponse.cs
 ├── Services/
+│   ├── TenantService.cs          # Reads tenant metadata from control DB
 │   ├── TokenService.cs           # OAuth client credentials token handling
 │   ├── BCApiService.cs           # Calls BC API endpoints with paging support
-│   └── SqlService.cs             # Upserts data into Azure SQL
+│   └── SqlService.cs             # SqlBulkCopy bulk insert + MERGE upsert
 ├── local.settings.json           # Local config - gitignored
 ├── local.settings.json.example   # Template - copy this to local.settings.json
 └── .gitignore
@@ -215,20 +307,69 @@ BC-AzureFunctions/
 
 The timer runs every 30 minutes by default (`0 */30 * * * *`). Change the cron expression in `SyncTimer.cs` to adjust.
 
-Incremental refresh uses `lastModifiedDateTime` - only records changed since the last successful sync are pulled. The `analytics.SyncLog` table tracks the last sync time per table.
+**Sync Process:**
+1. Queries `analyticsapi-control` for all active tenant environments
+2. For each tenant → environment → company:
+   - Authenticates with BC using OAuth
+   - Fetches data incrementally using `lastModifiedDateTime` filter
+   - Bulk inserts into staging table using SqlBulkCopy
+   - Merges from staging into target table
+   - Updates SyncLog and SyncHistory
+3. Logs success/failure in control database
 
-To force a full re-sync, reset the SyncLog in SSMS:
-
+To force a full re-sync for a specific environment:
 ```sql
+USE [analyticsapi-acme];
+GO
+
 UPDATE analytics.SyncLog 
-SET LastSyncDateTime = '2000-01-01';
+SET LastSyncDateTime = '2000-01-01'
+WHERE EnvironmentName = 'Production';
 ```
+
+## Adding a New Customer Tenant
+```sql
+USE [analyticsapi-control];
+GO
+
+-- 1. Create tenant database
+CREATE DATABASE [analyticsapi-newcustomer];
+-- (Run per-tenant schema script above)
+
+-- 2. Register tenant
+INSERT INTO dbo.Tenants (TenantName, TenantSlug, DatabaseServer, DatabaseName, SubscriptionStatus)
+VALUES ('New Customer Inc', 'newcustomer', '{yourserver}.database.windows.net', 'analyticsapi-newcustomer', 'Active');
+
+-- 3. Add their BC environment(s)
+DECLARE @TenantId UNIQUEIDENTIFIER = (SELECT TenantId FROM dbo.Tenants WHERE TenantSlug = 'newcustomer');
+
+INSERT INTO dbo.TenantEnvironments (
+    TenantId, EnvironmentName, BCTenantId, CompanyId, CompanyName, AzureADClientId
+)
+VALUES (
+    @TenantId,
+    'Production',
+    '{customer BC tenant GUID}',
+    '{customer company GUID}',
+    'New Customer Inc',
+    '{your Azure AD app client ID}'
+);
+```
+
+Next sync cycle will automatically include the new tenant.
+
+## Performance
+
+Full sync of 4,096 records completes in ~4 seconds using SqlBulkCopy bulk insert pattern.
+
+Typical production environment with 50,000 GL entries syncs in under 10 seconds.
 
 ## Security
 
 - `local.settings.json` is gitignored - credentials never leave your machine
 - Use `local.settings.json.example` as the setup template
 - Store secrets in Azure Key Vault when deploying to production
+- Per-tenant database isolation ensures complete data separation between customers
 
 ## Related
 
@@ -243,5 +384,9 @@ SET LastSyncDateTime = '2000-01-01';
 
 Proprietary. All rights reserved. 2026 Stein Saestad
 
-## Hours spent on project
-14.02.2026 - 15.02.2026 | 8 hours
+## Development Log
+
+| Date | Hours | Work |
+|---|---|---|
+| 14.02.2026 - 15.02.2026 | 8h | Initial BC AL extension and single-tenant sync |
+| 18.02.2026 | 6h | Multi-tenant architecture with control plane |
