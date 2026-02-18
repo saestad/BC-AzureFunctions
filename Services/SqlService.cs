@@ -7,58 +7,68 @@ using System.Data;
 
 public class SqlService
 {
-    private readonly string _connectionString;
     private readonly ILogger<SqlService> _logger;
 
     public SqlService(ILogger<SqlService> logger)
     {
-        _connectionString = Environment.GetEnvironmentVariable("SQL_CONNECTION_STRING")
-            ?? throw new Exception("SQL_CONNECTION_STRING not configured");
         _logger = logger;
     }
 
-    private SqlConnection GetConnection() => new SqlConnection(_connectionString);
+    private SqlConnection GetConnection(string connectionString) => new SqlConnection(connectionString);
 
-    public async Task<DateTime> GetLastSyncAsync(string tableName)
+    public async Task<DateTime> GetLastSyncAsync(string connectionString, string environmentName, string tableName)
     {
-        using var conn = GetConnection();
+        using var conn = GetConnection(connectionString);
         await conn.OpenAsync();
 
-        var cmd = new SqlCommand(
-            "SELECT LastSyncDateTime FROM analytics.SyncLog WHERE TableName = @TableName",
+        var cmd = new SqlCommand(@"
+            SELECT LastSyncDateTime 
+            FROM analytics.SyncLog 
+            WHERE EnvironmentName = @EnvironmentName AND TableName = @TableName",
             conn);
+        cmd.Parameters.AddWithValue("@EnvironmentName", environmentName);
         cmd.Parameters.AddWithValue("@TableName", tableName);
 
         var result = await cmd.ExecuteScalarAsync();
         return result != null ? (DateTime)result : new DateTime(2000, 1, 1);
     }
 
-    public async Task UpdateSyncLogAsync(string tableName, int rowsSynced, string status, string? error = null)
+    public async Task UpdateSyncLogAsync(string connectionString, string environmentName, string tableName, int rowsSynced, string status, string? error = null)
     {
-        using var conn = GetConnection();
+        using var conn = GetConnection(connectionString);
         await conn.OpenAsync();
 
         var cmd = new SqlCommand(@"
-            UPDATE analytics.SyncLog 
-            SET LastSyncDateTime = @LastSync,
-                RowsSynced = @RowsSynced,
-                SyncStatus = @Status,
-                LastError = @Error
-            WHERE TableName = @TableName", conn);
+            MERGE analytics.SyncLog AS target
+            USING (SELECT @EnvironmentName AS EnvironmentName, @TableName AS TableName) AS source
+            ON target.EnvironmentName = source.EnvironmentName AND target.TableName = source.TableName
+            WHEN MATCHED THEN 
+                UPDATE SET 
+                    LastSyncDateTime = @LastSync,
+                    RowsSynced = @RowsSynced,
+                    SyncStatus = @Status,
+                    LastError = @Error
+            WHEN NOT MATCHED THEN
+                INSERT (EnvironmentName, TableName, LastSyncDateTime, RowsSynced, SyncStatus, LastError)
+                VALUES (@EnvironmentName, @TableName, @LastSync, @RowsSynced, @Status, @Error);",
+            conn);
 
+        cmd.Parameters.AddWithValue("@EnvironmentName", environmentName);
+        cmd.Parameters.AddWithValue("@TableName", tableName);
         cmd.Parameters.AddWithValue("@LastSync", DateTime.UtcNow);
         cmd.Parameters.AddWithValue("@RowsSynced", rowsSynced);
         cmd.Parameters.AddWithValue("@Status", status);
         cmd.Parameters.AddWithValue("@Error", (object?)error ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@TableName", tableName);
 
         await cmd.ExecuteNonQueryAsync();
     }
 
-    public async Task UpsertGLAccountsAsync(List<GLAccount> accounts)
+    public async Task UpsertGLAccountsAsync(string connectionString, string environmentName, Guid companyId, List<GLAccount> accounts)
     {
         var dt = new DataTable();
         dt.Columns.Add("SystemId", typeof(Guid));
+        dt.Columns.Add("EnvironmentName", typeof(string));
+        dt.Columns.Add("CompanyId", typeof(Guid));
         dt.Columns.Add("No", typeof(string));
         dt.Columns.Add("Name", typeof(string));
         dt.Columns.Add("AccountType", typeof(string));
@@ -71,18 +81,21 @@ public class SqlService
         dt.Columns.Add("LastModifiedDateTime", typeof(DateTime));
 
         foreach (var a in accounts)
-            dt.Rows.Add(a.SystemId, a.No, a.Name, a.AccountType, a.AccountCategory,
-                a.AccountSubcategory, a.AccountSubcategoryEntryNo, a.IncomeBalance,
-                a.Indentation, a.Blocked, a.LastModifiedDateTime);
+            dt.Rows.Add(a.SystemId, environmentName, companyId, a.No, a.Name, a.AccountType, 
+                a.AccountCategory, a.AccountSubcategory, a.AccountSubcategoryEntryNo, 
+                a.IncomeBalance, a.Indentation, a.Blocked, a.LastModifiedDateTime);
 
-        using var conn = GetConnection();
+        using var conn = GetConnection(connectionString);
         await conn.OpenAsync();
 
         await BulkInsertStagingAsync(conn, dt, "#staging_Account");
 
         await new SqlCommand(@"
             MERGE analytics.dim_Account AS target
-            USING #staging_Account AS source ON target.SystemId = source.SystemId
+            USING #staging_Account AS source 
+                ON target.SystemId = source.SystemId 
+                AND target.EnvironmentName = source.EnvironmentName
+                AND target.CompanyId = source.CompanyId
             WHEN MATCHED THEN UPDATE SET
                 No = source.No, Name = source.Name, AccountType = source.AccountType,
                 AccountCategory = source.AccountCategory, AccountSubcategory = source.AccountSubcategory,
@@ -90,21 +103,25 @@ public class SqlService
                 IncomeBalance = source.IncomeBalance, Indentation = source.Indentation,
                 Blocked = source.Blocked, LastModifiedDateTime = source.LastModifiedDateTime
             WHEN NOT MATCHED THEN INSERT
-                (SystemId, No, Name, AccountType, AccountCategory, AccountSubcategory,
-                 AccountSubcategoryEntryNo, IncomeBalance, Indentation, Blocked, LastModifiedDateTime)
+                (SystemId, EnvironmentName, CompanyId, No, Name, AccountType, AccountCategory, 
+                 AccountSubcategory, AccountSubcategoryEntryNo, IncomeBalance, Indentation, 
+                 Blocked, LastModifiedDateTime)
             VALUES
-                (source.SystemId, source.No, source.Name, source.AccountType, source.AccountCategory,
-                 source.AccountSubcategory, source.AccountSubcategoryEntryNo, source.IncomeBalance,
-                 source.Indentation, source.Blocked, source.LastModifiedDateTime);
+                (source.SystemId, source.EnvironmentName, source.CompanyId, source.No, source.Name, 
+                 source.AccountType, source.AccountCategory, source.AccountSubcategory, 
+                 source.AccountSubcategoryEntryNo, source.IncomeBalance, source.Indentation, 
+                 source.Blocked, source.LastModifiedDateTime);
             DROP TABLE #staging_Account;", conn).ExecuteNonQueryAsync();
 
-        _logger.LogInformation("Upserted {Count} GL Accounts", accounts.Count);
+        _logger.LogInformation("Upserted {Count} GL Accounts for {Env}/{Company}", accounts.Count, environmentName, companyId);
     }
 
-    public async Task UpsertGLEntriesAsync(List<GLEntry> entries)
+    public async Task UpsertGLEntriesAsync(string connectionString, string environmentName, Guid companyId, List<GLEntry> entries)
     {
         var dt = new DataTable();
         dt.Columns.Add("SystemId", typeof(Guid));
+        dt.Columns.Add("EnvironmentName", typeof(string));
+        dt.Columns.Add("CompanyId", typeof(Guid));
         dt.Columns.Add("EntryNo", typeof(int));
         dt.Columns.Add("GLAccountNo", typeof(string));
         dt.Columns.Add("PostingDate", typeof(DateTime));
@@ -118,18 +135,21 @@ public class SqlService
         dt.Columns.Add("LastModifiedDateTime", typeof(DateTime));
 
         foreach (var e in entries)
-            dt.Rows.Add(e.SystemId, e.EntryNo, e.GLAccountNo, e.PostingDate, e.DocumentType,
-                e.DocumentNo, e.Description, e.Amount, e.DebitAmount, e.CreditAmount,
+            dt.Rows.Add(e.SystemId, environmentName, companyId, e.EntryNo, e.GLAccountNo, e.PostingDate, 
+                e.DocumentType, e.DocumentNo, e.Description, e.Amount, e.DebitAmount, e.CreditAmount,
                 e.DimensionSetId, e.LastModifiedDateTime);
 
-        using var conn = GetConnection();
+        using var conn = GetConnection(connectionString);
         await conn.OpenAsync();
 
         await BulkInsertStagingAsync(conn, dt, "#staging_GL");
 
         await new SqlCommand(@"
             MERGE analytics.fact_GL AS target
-            USING #staging_GL AS source ON target.SystemId = source.SystemId
+            USING #staging_GL AS source 
+                ON target.SystemId = source.SystemId 
+                AND target.EnvironmentName = source.EnvironmentName
+                AND target.CompanyId = source.CompanyId
             WHEN MATCHED THEN UPDATE SET
                 EntryNo = source.EntryNo, GLAccountNo = source.GLAccountNo,
                 PostingDate = source.PostingDate, DocumentType = source.DocumentType,
@@ -138,21 +158,23 @@ public class SqlService
                 CreditAmount = source.CreditAmount, DimensionSetId = source.DimensionSetId,
                 LastModifiedDateTime = source.LastModifiedDateTime
             WHEN NOT MATCHED THEN INSERT
-                (SystemId, EntryNo, GLAccountNo, PostingDate, DocumentType, DocumentNo,
+                (SystemId, EnvironmentName, CompanyId, EntryNo, GLAccountNo, PostingDate, DocumentType, DocumentNo,
                  Description, Amount, DebitAmount, CreditAmount, DimensionSetId, LastModifiedDateTime)
             VALUES
-                (source.SystemId, source.EntryNo, source.GLAccountNo, source.PostingDate,
+                (source.SystemId, source.EnvironmentName, source.CompanyId, source.EntryNo, source.GLAccountNo, source.PostingDate,
                  source.DocumentType, source.DocumentNo, source.Description, source.Amount,
                  source.DebitAmount, source.CreditAmount, source.DimensionSetId, source.LastModifiedDateTime);
             DROP TABLE #staging_GL;", conn).ExecuteNonQueryAsync();
 
-        _logger.LogInformation("Upserted {Count} GL Entries", entries.Count);
+        _logger.LogInformation("Upserted {Count} GL Entries for {Env}/{Company}", entries.Count, environmentName, companyId);
     }
 
-    public async Task UpsertDimensionSetEntriesAsync(List<DimensionSetEntry> dimensions)
+    public async Task UpsertDimensionSetEntriesAsync(string connectionString, string environmentName, Guid companyId, List<DimensionSetEntry> dimensions)
     {
         var dt = new DataTable();
         dt.Columns.Add("SystemId", typeof(Guid));
+        dt.Columns.Add("EnvironmentName", typeof(string));
+        dt.Columns.Add("CompanyId", typeof(Guid));
         dt.Columns.Add("DimensionSetId", typeof(int));
         dt.Columns.Add("DimensionCode", typeof(string));
         dt.Columns.Add("DimensionValueCode", typeof(string));
@@ -160,37 +182,42 @@ public class SqlService
         dt.Columns.Add("LastModifiedDateTime", typeof(DateTime));
 
         foreach (var d in dimensions)
-            dt.Rows.Add(d.SystemId, d.DimensionSetId, d.DimensionCode,
+            dt.Rows.Add(d.SystemId, environmentName, companyId, d.DimensionSetId, d.DimensionCode,
                 d.DimensionValueCode, d.DimensionValueName, d.LastModifiedDateTime);
 
-        using var conn = GetConnection();
+        using var conn = GetConnection(connectionString);
         await conn.OpenAsync();
 
         await BulkInsertStagingAsync(conn, dt, "#staging_Dimension");
 
         await new SqlCommand(@"
             MERGE analytics.dim_Dimension AS target
-            USING #staging_Dimension AS source ON target.SystemId = source.SystemId
+            USING #staging_Dimension AS source 
+                ON target.SystemId = source.SystemId 
+                AND target.EnvironmentName = source.EnvironmentName
+                AND target.CompanyId = source.CompanyId
             WHEN MATCHED THEN UPDATE SET
                 DimensionSetId = source.DimensionSetId, DimensionCode = source.DimensionCode,
                 DimensionValueCode = source.DimensionValueCode,
                 DimensionValueName = source.DimensionValueName,
                 LastModifiedDateTime = source.LastModifiedDateTime
             WHEN NOT MATCHED THEN INSERT
-                (SystemId, DimensionSetId, DimensionCode, DimensionValueCode,
+                (SystemId, EnvironmentName, CompanyId, DimensionSetId, DimensionCode, DimensionValueCode,
                  DimensionValueName, LastModifiedDateTime)
             VALUES
-                (source.SystemId, source.DimensionSetId, source.DimensionCode,
+                (source.SystemId, source.EnvironmentName, source.CompanyId, source.DimensionSetId, source.DimensionCode,
                  source.DimensionValueCode, source.DimensionValueName, source.LastModifiedDateTime);
             DROP TABLE #staging_Dimension;", conn).ExecuteNonQueryAsync();
 
-        _logger.LogInformation("Upserted {Count} Dimension Set Entries", dimensions.Count);
+        _logger.LogInformation("Upserted {Count} Dimension Set Entries for {Env}/{Company}", dimensions.Count, environmentName, companyId);
     }
 
-    public async Task UpsertGLBudgetEntriesAsync(List<GLBudgetEntry> budgetEntries)
+    public async Task UpsertGLBudgetEntriesAsync(string connectionString, string environmentName, Guid companyId, List<GLBudgetEntry> budgetEntries)
     {
         var dt = new DataTable();
         dt.Columns.Add("SystemId", typeof(Guid));
+        dt.Columns.Add("EnvironmentName", typeof(string));
+        dt.Columns.Add("CompanyId", typeof(Guid));
         dt.Columns.Add("EntryNo", typeof(int));
         dt.Columns.Add("BudgetName", typeof(string));
         dt.Columns.Add("GLAccountNo", typeof(string));
@@ -201,17 +228,20 @@ public class SqlService
         dt.Columns.Add("LastModifiedDateTime", typeof(DateTime));
 
         foreach (var b in budgetEntries)
-            dt.Rows.Add(b.SystemId, b.EntryNo, b.BudgetName, b.GLAccountNo, b.Date,
+            dt.Rows.Add(b.SystemId, environmentName, companyId, b.EntryNo, b.BudgetName, b.GLAccountNo, b.Date,
                 b.Amount, b.Description, b.DimensionSetId, b.LastModifiedDateTime);
 
-        using var conn = GetConnection();
+        using var conn = GetConnection(connectionString);
         await conn.OpenAsync();
 
         await BulkInsertStagingAsync(conn, dt, "#staging_Budget");
 
         await new SqlCommand(@"
             MERGE analytics.fact_Budget AS target
-            USING #staging_Budget AS source ON target.SystemId = source.SystemId
+            USING #staging_Budget AS source 
+                ON target.SystemId = source.SystemId 
+                AND target.EnvironmentName = source.EnvironmentName
+                AND target.CompanyId = source.CompanyId
             WHEN MATCHED THEN UPDATE SET
                 EntryNo = source.EntryNo, BudgetName = source.BudgetName,
                 GLAccountNo = source.GLAccountNo, Date = source.Date,
@@ -219,20 +249,19 @@ public class SqlService
                 DimensionSetId = source.DimensionSetId,
                 LastModifiedDateTime = source.LastModifiedDateTime
             WHEN NOT MATCHED THEN INSERT
-                (SystemId, EntryNo, BudgetName, GLAccountNo, Date,
+                (SystemId, EnvironmentName, CompanyId, EntryNo, BudgetName, GLAccountNo, Date,
                  Amount, Description, DimensionSetId, LastModifiedDateTime)
             VALUES
-                (source.SystemId, source.EntryNo, source.BudgetName, source.GLAccountNo,
+                (source.SystemId, source.EnvironmentName, source.CompanyId, source.EntryNo, source.BudgetName, source.GLAccountNo,
                  source.Date, source.Amount, source.Description,
                  source.DimensionSetId, source.LastModifiedDateTime);
             DROP TABLE #staging_Budget;", conn).ExecuteNonQueryAsync();
 
-        _logger.LogInformation("Upserted {Count} GL Budget Entries", budgetEntries.Count);
+        _logger.LogInformation("Upserted {Count} GL Budget Entries for {Env}/{Company}", budgetEntries.Count, environmentName, companyId);
     }
 
     private static async Task BulkInsertStagingAsync(SqlConnection conn, DataTable dt, string stagingTable)
     {
-        // Create staging table matching the DataTable structure
         var columns = string.Join(", ", dt.Columns.Cast<DataColumn>().Select(c =>
             $"[{c.ColumnName}] {GetSqlType(c.DataType)}"));
 
@@ -240,7 +269,6 @@ public class SqlService
             $"CREATE TABLE {stagingTable} ({columns})", conn)
             .ExecuteNonQueryAsync();
 
-        // Bulk insert into staging
         using var bulk = new SqlBulkCopy(conn)
         {
             DestinationTableName = stagingTable,

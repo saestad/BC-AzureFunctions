@@ -1,9 +1,12 @@
 namespace AnalyticsAPI.Sync.Models;
 
+using System.Text.Json.Serialization;
+
 public class ODataResponse<T>
 {
+    [JsonPropertyName("value")]
     public List<T> Value { get; set; } = new();
 
-    [Newtonsoft.Json.JsonProperty("@odata.nextLink")]
-    public string? NextLink { get; set; }
+    [JsonPropertyName("@odata.nextLink")]
+    public string? ODataNextLink { get; set; }
 }

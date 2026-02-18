@@ -1,49 +1,45 @@
 namespace AnalyticsAPI.Sync.Services;
 
-using System.Text;
-using System.Text.Json;
 using Microsoft.Extensions.Logging;
+using System.Text.Json.Serialization;
 
 public class TokenService
 {
     private readonly HttpClient _httpClient;
     private readonly ILogger<TokenService> _logger;
-    private readonly string _tenantId;
-    private readonly string _clientId;
+    private readonly Dictionary<Guid, CachedToken> _tokenCache = new();
     private readonly string _clientSecret;
 
-    private string? _cachedToken;
-    private DateTime _tokenExpiry = DateTime.MinValue;
-
-    public TokenService(HttpClient httpClient, ILogger<TokenService> logger)
+    public TokenService(ILogger<TokenService> logger)
     {
-        _httpClient = httpClient;
+        _httpClient = new HttpClient();
         _logger = logger;
-        _tenantId = Environment.GetEnvironmentVariable("BC_TENANT_ID") ?? throw new Exception("BC_TENANT_ID not configured");
-        _clientId = Environment.GetEnvironmentVariable("BC_CLIENT_ID") ?? throw new Exception("BC_CLIENT_ID not configured");
-        _clientSecret = Environment.GetEnvironmentVariable("BC_CLIENT_SECRET") ?? throw new Exception("BC_CLIENT_SECRET not configured");
+        _clientSecret = Environment.GetEnvironmentVariable("BC_CLIENT_SECRET")
+            ?? throw new Exception("BC_CLIENT_SECRET not configured");
     }
 
-    public async Task<string> GetTokenAsync()
+    public async Task<string> GetTokenAsync(Guid tenantId, Guid clientId)
     {
-        if (_cachedToken != null && DateTime.UtcNow < _tokenExpiry)
+        // Check cache
+        if (_tokenCache.TryGetValue(clientId, out var cached) && cached.ExpiresAt > DateTime.UtcNow.AddSeconds(60))
         {
-            return _cachedToken;
+            _logger.LogInformation("Using cached token for client {ClientId}", clientId);
+            return cached.AccessToken;
         }
 
+        // Fetch new token
         _logger.LogInformation("Fetching new OAuth token from Azure AD");
 
-        var url = $"https://login.microsoftonline.com/{_tenantId}/oauth2/v2.0/token";
-
+        var tokenUrl = $"https://login.microsoftonline.com/{tenantId}/oauth2/v2.0/token";
         var body = new FormUrlEncodedContent(new[]
         {
-            new KeyValuePair<string, string>("grant_type", "client_credentials"),
-            new KeyValuePair<string, string>("client_id", _clientId),
+            new KeyValuePair<string, string>("client_id", clientId.ToString()),
             new KeyValuePair<string, string>("client_secret", _clientSecret),
-            new KeyValuePair<string, string>("scope", "https://api.businesscentral.dynamics.com/.default")
+            new KeyValuePair<string, string>("scope", "https://api.businesscentral.dynamics.com/.default"),
+            new KeyValuePair<string, string>("grant_type", "client_credentials")
         });
 
-        var response = await _httpClient.PostAsync(url, body);
+        var response = await _httpClient.PostAsync(tokenUrl, body);
         var content = await response.Content.ReadAsStringAsync();
 
         if (!response.IsSuccessStatusCode)
@@ -52,15 +48,40 @@ public class TokenService
             throw new Exception($"Token request failed: {content}");
         }
 
-        var json = JsonDocument.Parse(content);
-        _cachedToken = json.RootElement.GetProperty("access_token").GetString()
-            ?? throw new Exception("access_token missing from response");
+        var tokenResponse = System.Text.Json.JsonSerializer.Deserialize<TokenResponse>(content, new System.Text.Json.JsonSerializerOptions
+        {
+            PropertyNameCaseInsensitive = true
+        });
+        
+        if (tokenResponse?.AccessToken == null)
+        {
+            _logger.LogError("Token response missing access_token. Response: {Content}", content);
+            throw new Exception("Token response missing access_token");
+        }
 
-        var expiresIn = json.RootElement.GetProperty("expires_in").GetInt32();
-        _tokenExpiry = DateTime.UtcNow.AddSeconds(expiresIn - 60);
+        // Cache token
+        _tokenCache[clientId] = new CachedToken
+        {
+            AccessToken = tokenResponse.AccessToken,
+            ExpiresAt = DateTime.UtcNow.AddSeconds(tokenResponse.ExpiresIn)
+        };
 
-        _logger.LogInformation("Token acquired successfully, expires in {ExpiresIn}s", expiresIn);
+        _logger.LogInformation("Token acquired successfully, expires in {Seconds}s", tokenResponse.ExpiresIn);
+        return tokenResponse.AccessToken;
+    }
 
-        return _cachedToken;
+    private class CachedToken
+    {
+        public string AccessToken { get; set; } = string.Empty;
+        public DateTime ExpiresAt { get; set; }
+    }
+
+    private class TokenResponse
+    {
+        [JsonPropertyName("access_token")]
+        public string? AccessToken { get; set; }
+        
+        [JsonPropertyName("expires_in")]
+        public int ExpiresIn { get; set; }
     }
 }
