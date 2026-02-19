@@ -327,6 +327,51 @@ SET LastSyncDateTime = '2000-01-01'
 WHERE EnvironmentName = 'Production';
 ```
 
+## Deploying to Azure
+
+### Create Function App
+
+1. In Azure Portal, create a Function App:
+   - Runtime: .NET 8 (Isolated)
+   - Region: Same as your SQL Server
+   - Plan: Consumption (Serverless)
+   - Memory: 512 MB
+
+### Configure Application Settings
+
+In the Function App, go to **Configuration** → **Application settings** and add:
+
+| Setting | Value |
+|---|---|
+| `BC_CLIENT_SECRET` | Your Azure AD app client secret |
+| `SQL_USER` | SQL Server username |
+| `SQL_PASSWORD` | SQL Server password |
+| `CONTROL_DB_CONNECTION_STRING` | Full connection string to `analyticsapi-control` |
+| `FUNCTIONS_INPROC_NET8_ENABLED` | `1` |
+
+### Configure SQL Firewall
+
+In your SQL Server → **Networking**:
+- Toggle ON: **Allow Azure services and resources to access this server**
+- Or add specific Function App outbound IPs to firewall rules
+
+### Deploy from VS Code
+
+1. Install Azure Functions extension
+2. Sign in to Azure
+3. Right-click your Function App → **Deploy to Function App**
+4. Wait for deployment to complete
+
+### Verify Deployment
+
+- Go to Function App → **Functions** → **SyncTimer** → **Monitor**
+- Check execution history for successful runs every 30 minutes
+- Verify data in SQL:
+```sql
+  SELECT TOP 10 * FROM [analyticsapi-control].dbo.SyncHistory 
+  ORDER BY SyncStarted DESC;
+```
+
 ## Adding a New Customer Tenant
 ```sql
 USE [analyticsapi-control];
